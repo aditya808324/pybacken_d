@@ -1,12 +1,11 @@
 """
-sheets.py — Google Sheets Integration Layer (ENV VERSION)
+sheets.py — Google Sheets Integration Layer (FINAL STABLE)
 =========================================================
 Uses GOOGLE_CREDENTIALS env var (one-line JSON)
 
-Setup:
-  1. Set env var: GOOGLE_CREDENTIALS = {one-line JSON}
-  2. Set env var: GOOGLE_SHEET_NAME = Salon CRM
-  3. Share sheet with service account email
+ENV REQUIRED:
+  GOOGLE_CREDENTIALS = {one-line JSON}
+  GOOGLE_SHEET_NAME = Salon CRM
 """
 
 import logging
@@ -21,7 +20,7 @@ from oauth2client.service_account import ServiceAccountCredentials
 
 logger = logging.getLogger(__name__)
 
-# ── Config ────────────────────────────────────────────────────────────────────
+# ── CONFIG ───────────────────────────────────────────────
 SHEET_NAME = os.getenv("GOOGLE_SHEET_NAME", "Salon CRM")
 CREDS_JSON = os.getenv("GOOGLE_CREDENTIALS")
 
@@ -33,13 +32,12 @@ SCOPES = [
 RETRY_COUNT = 3
 RETRY_DELAY = 2
 
-# ── Sheet Tabs ────────────────────────────────────────────────────────────────
+# ── TABS ─────────────────────────────────────────────────
 TAB_BOOKINGS = "Bookings"
 TAB_CLIENTS = "Clients"
-TAB_BACKUP = "Backup"
 TAB_REVENUE = "Revenue"
 
-# ── Headers ───────────────────────────────────────────────────────────────────
+# ── HEADERS ──────────────────────────────────────────────
 HEADERS = {
     TAB_BOOKINGS: [
         "Booking ID", "User ID", "Name", "Username",
@@ -53,18 +51,11 @@ HEADERS = {
     TAB_REVENUE: [
         "Date", "Bookings", "Revenue",
     ],
-    TAB_BACKUP: [
-        "Booking ID", "Client Name", "Telegram ID", "Username",
-        "Service", "Stylist", "Date", "Time", "Duration",
-        "Price", "Status", "Notes",
-        "24h Reminder Sent", "1h Reminder Sent", "Booked At",
-    ],
 }
 
-
-# ══════════════════════════════════════════════════════════════════════════════
+# ════════════════════════════════════════════════════════
 # CONNECTION CACHE
-# ══════════════════════════════════════════════════════════════════════════════
+# ════════════════════════════════════════════════════════
 
 class SheetsClient:
     _gc: Optional[gspread.Client] = None
@@ -73,16 +64,16 @@ class SheetsClient:
     _AUTH_TTL: int = 3000
 
     @classmethod
-    def _needs_reauth(cls) -> bool:
+    def _needs_reauth(cls):
         return cls._gc is None or (time.time() - cls._last_auth) > cls._AUTH_TTL
 
     @classmethod
-    def get_spreadsheet(cls) -> Optional[gspread.Spreadsheet]:
+    def get_spreadsheet(cls):
         try:
             if cls._needs_reauth():
 
                 if not CREDS_JSON:
-                    logger.warning("[SHEETS] GOOGLE_CREDENTIALS missing")
+                    logger.warning("GOOGLE_CREDENTIALS missing")
                     return None
 
                 creds_dict = json.loads(CREDS_JSON)
@@ -92,10 +83,10 @@ class SheetsClient:
                 )
 
                 cls._gc = gspread.authorize(creds)
-                cls._last_auth = time.time()
                 cls._spreadsheet = None
+                cls._last_auth = time.time()
 
-                logger.info("[SHEETS] Auth success (ENV)")
+                logger.info("Sheets auth success")
 
             if cls._spreadsheet is None:
                 cls._spreadsheet = _get_or_create_spreadsheet(cls._gc)
@@ -103,23 +94,17 @@ class SheetsClient:
             return cls._spreadsheet
 
         except Exception as e:
-            logger.error(f"[SHEETS] Connection error: {e}")
+            logger.error(f"Sheets connection error: {e}")
             cls._gc = None
             cls._spreadsheet = None
             return None
 
-    @classmethod
-    def invalidate(cls):
-        cls._gc = None
-        cls._spreadsheet = None
-        cls._last_auth = 0
 
-
-# ══════════════════════════════════════════════════════════════════════════════
+# ════════════════════════════════════════════════════════
 # SETUP
-# ══════════════════════════════════════════════════════════════════════════════
+# ════════════════════════════════════════════════════════
 
-def _get_or_create_spreadsheet(gc: gspread.Client) -> gspread.Spreadsheet:
+def _get_or_create_spreadsheet(gc):
     try:
         sh = gc.open(SHEET_NAME)
     except gspread.SpreadsheetNotFound:
@@ -129,7 +114,7 @@ def _get_or_create_spreadsheet(gc: gspread.Client) -> gspread.Spreadsheet:
     return sh
 
 
-def _ensure_tabs(sh: gspread.Spreadsheet):
+def _ensure_tabs(sh):
     existing = {ws.title for ws in sh.worksheets()}
 
     for tab, headers in HEADERS.items():
@@ -141,31 +126,24 @@ def _ensure_tabs(sh: gspread.Spreadsheet):
             if not ws.row_values(1):
                 ws.insert_row(headers, 1)
 
-    for ws in sh.worksheets():
-        if ws.title == "Sheet1":
-            try:
-                sh.del_worksheet(ws)
-            except:
-                pass
 
-
-# ══════════════════════════════════════════════════════════════════════════════
+# ════════════════════════════════════════════════════════
 # RETRY
-# ══════════════════════════════════════════════════════════════════════════════
+# ════════════════════════════════════════════════════════
 
 def _with_retry(func, *args, **kwargs):
-    for i in range(RETRY_COUNT):
+    for _ in range(RETRY_COUNT):
         try:
             func(*args, **kwargs)
             return True
-        except Exception as e:
+        except Exception:
             time.sleep(RETRY_DELAY)
     return False
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-# FUNCTIONS
-# ══════════════════════════════════════════════════════════════════════════════
+# ════════════════════════════════════════════════════════
+# MAIN FUNCTIONS
+# ════════════════════════════════════════════════════════
 
 def sync_booking(data: dict):
     sh = SheetsClient.get_spreadsheet()
@@ -216,13 +194,34 @@ def sync_client(data: dict):
             vip,
         ]
 
-        ws.append_row(row)
+        _with_retry(ws.append_row, row)
 
     except Exception as e:
         logger.error(f"sync_client error: {e}")
 
 
-def sheets_health_check() -> bool:
+def update_booking_status(booking_id: str, new_status: str):
+    sh = SheetsClient.get_spreadsheet()
+    if not sh:
+        return False
+
+    try:
+        ws = sh.worksheet(TAB_BOOKINGS)
+        records = ws.get_all_records()
+
+        for i, row in enumerate(records, start=2):
+            if str(row.get("Booking ID")) == str(booking_id):
+                ws.update_cell(i, 10, new_status)  # Status column
+                return True
+
+        return False
+
+    except Exception as e:
+        logger.error(f"update_booking_status error: {e}")
+        return False
+
+
+def sheets_health_check():
     try:
         return SheetsClient.get_spreadsheet() is not None
     except:
