@@ -1,8 +1,6 @@
 """
-sheets.py — Google Sheets Integration Layer (FINAL STABLE)
-=========================================================
-Uses GOOGLE_CREDENTIALS env var (one-line JSON)
-
+sheets.py — Google Sheets Integration Layer (FINAL COMPLETE VERSION)
+===================================================================
 ENV REQUIRED:
   GOOGLE_CREDENTIALS = {one-line JSON}
   GOOGLE_SHEET_NAME = Salon CRM
@@ -36,6 +34,7 @@ RETRY_DELAY = 2
 TAB_BOOKINGS = "Bookings"
 TAB_CLIENTS = "Clients"
 TAB_REVENUE = "Revenue"
+TAB_BACKUP = "Backup"
 
 # ── HEADERS ──────────────────────────────────────────────
 HEADERS = {
@@ -50,6 +49,12 @@ HEADERS = {
     ],
     TAB_REVENUE: [
         "Date", "Bookings", "Revenue",
+    ],
+    TAB_BACKUP: [
+        "Booking ID", "Client Name", "Telegram ID", "Username",
+        "Service", "Stylist", "Date", "Time", "Duration",
+        "Price", "Status", "Notes",
+        "24h Reminder Sent", "1h Reminder Sent", "Booked At",
     ],
 }
 
@@ -211,13 +216,69 @@ def update_booking_status(booking_id: str, new_status: str):
 
         for i, row in enumerate(records, start=2):
             if str(row.get("Booking ID")) == str(booking_id):
-                ws.update_cell(i, 10, new_status)  # Status column
+                ws.update_cell(i, 10, new_status)
                 return True
 
         return False
 
     except Exception as e:
         logger.error(f"update_booking_status error: {e}")
+        return False
+
+
+def push_backup_to_sheet(data: dict):
+    sh = SheetsClient.get_spreadsheet()
+    if not sh:
+        return False
+
+    try:
+        ws = sh.worksheet(TAB_BACKUP)
+
+        row = [
+            data.get("id", ""),
+            data.get("client_name", ""),
+            str(data.get("user_id", "")),
+            data.get("username", ""),
+            data.get("service", ""),
+            data.get("stylist", ""),
+            data.get("date", ""),
+            data.get("time", ""),
+            data.get("duration", ""),
+            str(data.get("price", "")),
+            data.get("status", ""),
+            data.get("notes", ""),
+            data.get("reminder_24h", ""),
+            data.get("reminder_1h", ""),
+            data.get("created_at", datetime.now().strftime("%Y-%m-%d %H:%M")),
+        ]
+
+        _with_retry(ws.append_row, row)
+        return True
+
+    except Exception as e:
+        logger.error(f"push_backup_to_sheet error: {e}")
+        return False
+
+
+def push_all_revenue(total_bookings: int, total_revenue: float):
+    sh = SheetsClient.get_spreadsheet()
+    if not sh:
+        return False
+
+    try:
+        ws = sh.worksheet(TAB_REVENUE)
+
+        row = [
+            datetime.now().strftime("%Y-%m-%d"),
+            total_bookings,
+            total_revenue,
+        ]
+
+        _with_retry(ws.append_row, row)
+        return True
+
+    except Exception as e:
+        logger.error(f"push_all_revenue error: {e}")
         return False
 
 
