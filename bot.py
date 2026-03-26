@@ -1,21 +1,11 @@
 """
-bot.py — Maison Lumière Salon Booking Bot v3.0 (CRM Upgrade)
+bot.py — Maison Lumière Salon Booking Bot v3.1 (Sheets-Only)
 =============================================================
-Changes vs v2:
-  ✅ Modular imports (db.py, sheets.py, backup.py)
-  ✅ Google Sheets sync on every booking create/cancel
-  ✅ Client sync with VIP logic pushed to Sheets
-  ✅ Improved reminder messages (warmer, human tone)
-  ✅ /status shows Google Sheets health
-  ✅ Hardcoded secrets removed — all via env vars
-  ✅ Logging improvements
-  ✅ Admin notification improvements
-
-Install:
-    pip install -r requirements.txt
-
-Run:
-    BOT_TOKEN=xxx ADMIN_CHAT_ID=yyy python bot.py
+Changes vs v3.0:
+✅ All booking reads/writes go through Google Sheets
+✅ SQLite (db.py) only used for settings, staff, services
+✅ No more data loss on Railway redeploy
+✅ /admin, /mybookings, /today, reminders all read from Sheets
 """
 
 import json
@@ -38,16 +28,28 @@ from db import (
     init_db, get_db,
     get_setting, set_setting, get_all_settings,
     get_available_slots, get_booked_slots, is_slot_available,
-    save_booking, get_booking, cancel_booking,
-    get_user_bookings, get_todays_bookings,
-    get_upcoming_reminders, mark_reminder_sent,
-    get_staff, get_services, get_client,
+    get_staff, get_services,
     fmt_price, fmt_date,
 )
-from sheets import sync_booking, sync_client, update_booking_status, sheets_health_check
+from sheets import (
+    save_booking_to_sheets,
+    cancel_booking_in_sheets,
+    update_booking_status,
+    mark_reminder_sent_sheets,
+    get_all_bookings,
+    get_booking,
+    get_user_bookings,
+    get_todays_bookings,
+    get_upcoming_reminders,
+    get_all_clients,
+    get_all_user_ids,
+    push_backup_to_sheet,
+    push_all_revenue,
+    sheets_health_check,
+)
 from backup import run_backup
 
-# ── Config (all from environment — no hardcoded secrets) ─────────────────────
+# ── Config ────────────────────────────────────────────────────────────────────
 BOT_TOKEN     = os.getenv("BOT_TOKEN")
 MINI_APP_URL  = os.getenv("MINI_APP_URL", "https://telebot-eight-peach.vercel.app")
 ADMIN_CHAT_ID = int(os.getenv("ADMIN_CHAT_ID", "0"))
@@ -70,18 +72,17 @@ logger = logging.getLogger(__name__)
 # ══════════════════════════════════════════════════════════════════════════════
 
 def booking_confirm_msg(b: dict, client_name: str) -> str:
-    """Client-facing booking confirmation message."""
-    notes = f"\n📝 *Notes:*      {b['notes']}" if b.get("notes") else ""
+    notes = f"\n📝 *Notes:* {b['notes']}" if b.get("notes") else ""
     return (
         f"✅ *You're all set, {client_name}!*\n"
         f"━━━━━━━━━━━━━━━━━━━━\n\n"
         f"We're looking forward to seeing you ✨\n\n"
-        f"🪄 *Service:*   {b['service']}\n"
-        f"👤 *Stylist:*    {b['stylist']}\n"
-        f"📅 *Date:*       {fmt_date(b['date'])}\n"
-        f"⏰ *Time:*       {b['time']}\n"
-        f"⌛ *Duration:*  {b['duration']}\n"
-        f"💰 *Total:*      {fmt_price(b['price'])}"
+        f"🪄 *Service:* {b['service']}\n"
+        f"👤 *Stylist:* {b['stylist']}\n"
+        f"📅 *Date:* {fmt_date(b['date'])}\n"
+        f"⏰ *Time:* {b['time']}\n"
+        f"⌛ *Duration:* {b['duration']}\n"
+        f"💰 *Total:* {fmt_price(b['price'])}"
         f"{notes}\n\n"
         f"━━━━━━━━━━━━━━━━━━━━\n"
         f"🔖 *Booking ID:* `{b['id']}`\n\n"
@@ -90,21 +91,20 @@ def booking_confirm_msg(b: dict, client_name: str) -> str:
 
 
 def admin_alert_msg(b: dict, user) -> str:
-    """Admin-facing new booking notification."""
     salon = get_setting("salon_name", "Salon")
-    notes = f"\n📝 Notes:    {b['notes']}" if b.get("notes") else ""
+    notes = f"\n📝 Notes: {b['notes']}" if b.get("notes") else ""
     uname = f" (@{user.username})" if user.username else ""
     return (
         f"🔔 *NEW BOOKING — {b['id']}*\n"
         f"━━━━━━━━━━━━━━━━━━━━\n\n"
-        f"👤 *Client:*     [{user.full_name}](tg://user?id={user.id}){uname}\n"
-        f"🆔 *User ID:*   `{user.id}`\n\n"
-        f"🪄 *Service:*   {b['service']}\n"
-        f"👩‍🎨 *Stylist:*    {b['stylist']}\n"
-        f"📅 *Date:*       {fmt_date(b['date'])}\n"
-        f"⏰ *Time:*       {b['time']}\n"
-        f"⌛ *Duration:*  {b['duration']}\n"
-        f"💰 *Total:*      {fmt_price(b['price'])}"
+        f"👤 *Client:* [{user.full_name}](tg://user?id={user.id}){uname}\n"
+        f"🆔 *User ID:* `{user.id}`\n\n"
+        f"🪄 *Service:* {b['service']}\n"
+        f"👩‍🎨 *Stylist:* {b['stylist']}\n"
+        f"📅 *Date:* {fmt_date(b['date'])}\n"
+        f"⏰ *Time:* {b['time']}\n"
+        f"⌛ *Duration:* {b['duration']}\n"
+        f"💰 *Total:* {fmt_price(b['price'])}"
         f"{notes}\n\n"
         f"🔖 *Booking ID:* `{b['id']}`"
     )
@@ -116,7 +116,7 @@ def admin_alert_msg(b: dict, user) -> str:
 
 def book_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([[
-        InlineKeyboardButton("✦  Book an Appointment", web_app=WebAppInfo(url=MINI_APP_URL))
+        InlineKeyboardButton("✦ Book an Appointment", web_app=WebAppInfo(url=MINI_APP_URL))
     ]])
 
 
@@ -125,7 +125,6 @@ def book_keyboard() -> InlineKeyboardMarkup:
 # ══════════════════════════════════════════════════════════════════════════════
 
 def admin_only(func):
-    """Decorator that restricts a command handler to the admin user."""
     async def wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if update.effective_user.id != ADMIN_CHAT_ID:
             await update.message.reply_text("⛔ Admin only.")
@@ -139,13 +138,13 @@ def admin_only(func):
 # ══════════════════════════════════════════════════════════════════════════════
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user  = update.effective_user
+    user = update.effective_user
     salon = get_setting("salon_name", "Maison Lumière")
     keyboard = InlineKeyboardMarkup([
-        [InlineKeyboardButton("✦  Book an Appointment", web_app=WebAppInfo(url=MINI_APP_URL))],
+        [InlineKeyboardButton("✦ Book an Appointment", web_app=WebAppInfo(url=MINI_APP_URL))],
         [
             InlineKeyboardButton("📋 My Bookings", callback_data="my_bookings"),
-            InlineKeyboardButton("ℹ️ About",        callback_data="about"),
+            InlineKeyboardButton("ℹ️ About", callback_data="about"),
         ],
     ])
     await update.message.reply_text(
@@ -166,8 +165,8 @@ async def book(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def my_bookings_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    uid  = update.effective_user.id
-    rows = get_user_bookings(uid)
+    uid = update.effective_user.id
+    rows = get_user_bookings(uid)   # ← reads from Sheets
 
     if not rows:
         await update.message.reply_text(
@@ -180,9 +179,9 @@ async def my_bookings_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         icon = "✅" if b["status"] == "confirmed" else "❌"
         lines.append(
             f"{icon} `{b['id']}`\n"
-            f"🪄 {b['service']}  |  👤 {b['stylist']}\n"
-            f"📅 {fmt_date(b['date'])}  ⏰ {b['time']}\n"
-            f"💰 {fmt_price(b['price'])}  |  _{b['status'].title()}_"
+            f"🪄 {b['service']} | 👤 {b['stylist']}\n"
+            f"📅 {fmt_date(b['date'])} ⏰ {b['time']}\n"
+            f"💰 {fmt_price(b['price'])} | _{b['status'].title()}_"
         )
 
     keyboard = InlineKeyboardMarkup([[
@@ -194,7 +193,7 @@ async def my_bookings_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def cancel_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    uid  = update.effective_user.id
+    uid = update.effective_user.id
     args = context.args
 
     if not args:
@@ -205,7 +204,7 @@ async def cancel_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     ref = args[0].upper()
-    b   = get_booking(ref)
+    b = get_booking(ref)   # ← reads from Sheets
 
     if not b:
         await update.message.reply_text(f"❌ Booking `{ref}` not found.", parse_mode="Markdown")
@@ -223,13 +222,13 @@ async def cancel_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     keyboard = InlineKeyboardMarkup([[
         InlineKeyboardButton("✅ Yes, cancel it", callback_data=f"confirm_cancel:{ref}"),
-        InlineKeyboardButton("❌ Keep it",         callback_data="cancel_abort"),
+        InlineKeyboardButton("❌ Keep it", callback_data="cancel_abort"),
     ]])
     await update.message.reply_text(
         f"Are you sure you want to cancel this booking?\n\n"
         f"🔖 `{ref}`\n"
-        f"🪄 {b['service']}  |  👤 {b['stylist']}\n"
-        f"📅 {fmt_date(b['date'])}  ⏰ {b['time']}",
+        f"🪄 {b['service']} | 👤 {b['stylist']}\n"
+        f"📅 {fmt_date(b['date'])} ⏰ {b['time']}",
         parse_mode="Markdown",
         reply_markup=keyboard,
     )
@@ -246,7 +245,7 @@ async def reschedule_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     ref = args[0].upper()
-    b   = get_booking(ref)
+    b = get_booking(ref)   # ← Sheets
 
     if not b or b["user_id"] != update.effective_user.id:
         await update.message.reply_text("❌ Booking not found or not yours.")
@@ -254,11 +253,11 @@ async def reschedule_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     keyboard = InlineKeyboardMarkup([[
         InlineKeyboardButton("✅ Yes, reschedule", callback_data=f"confirm_reschedule:{ref}"),
-        InlineKeyboardButton("❌ Keep it",          callback_data="cancel_abort"),
+        InlineKeyboardButton("❌ Keep it", callback_data="cancel_abort"),
     ]])
     await update.message.reply_text(
         f"Rescheduling will cancel `{ref}` and open the booking app.\n\n"
-        f"🪄 {b['service']}  |  📅 {fmt_date(b['date'])}  ⏰ {b['time']}\n\n"
+        f"🪄 {b['service']} | 📅 {fmt_date(b['date'])} ⏰ {b['time']}\n\n"
         f"Proceed?",
         parse_mode="Markdown",
         reply_markup=keyboard,
@@ -266,15 +265,15 @@ async def reschedule_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    uid      = update.effective_user.id
-    s        = get_all_settings()
+    uid = update.effective_user.id
+    s = get_all_settings()
     is_admin = uid == ADMIN_CHAT_ID
 
-    with get_db() as db:
-        total_bookings = db.execute("SELECT COUNT(*) as c FROM bookings").fetchone()["c"]
-        total_clients  = db.execute("SELECT COUNT(*) as c FROM clients").fetchone()["c"]
+    # Count from Sheets
+    all_bookings = get_all_bookings()
+    total_bookings = len(all_bookings)
+    confirmed = sum(1 for b in all_bookings if b["status"] == "confirmed")
 
-    # [NEW] Check Google Sheets health
     sheets_ok = sheets_health_check()
 
     lines = [
@@ -282,13 +281,12 @@ async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "✅ Bot running",
         f"{'✅' if MINI_APP_URL.startswith('https') else '❌'} Mini App: `{MINI_APP_URL}`",
         f"{'✅' if is_admin else '⚠️'} Your ID `{uid}` {'= Admin' if is_admin else '≠ Admin'}",
-        f"{'✅' if sheets_ok else '⚠️'} Google Sheets: {'Connected' if sheets_ok else 'Unavailable (bot still works)'}",
+        f"{'✅' if sheets_ok else '⚠️'} Google Sheets: {'Connected' if sheets_ok else 'Unavailable'}",
         f"\n🏪 *{s.get('salon_name', '—')}*",
         f"📍 {s.get('salon_address', '—')}",
         f"📞 {s.get('salon_phone', '—')}",
         f"🕐 {s.get('open_time', '—')} – {s.get('close_time', '—')}",
-        f"\n📊 Total bookings: *{total_bookings}*",
-        f"👥 Total clients:  *{total_clients}*",
+        f"\n📊 Total bookings: *{total_bookings}* ({confirmed} confirmed)",
     ]
     await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
 
@@ -323,8 +321,8 @@ async def setup_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/setcurrency ₹\n\n"
         "*Hours:*\n"
         "/sethours 09:00 18:00\n"
-        "/setdays 1,2,3,4,5  _(0=Mon, 6=Sun)_\n"
-        "/setslot 60  _(slot duration in minutes)_\n\n"
+        "/setdays 1,2,3,4,5 _(0=Mon, 6=Sun)_\n"
+        "/setslot 60 _(slot duration in minutes)_\n\n"
         "*Services:*\n"
         "/addservice Name|Duration|Price\n"
         "/listservices\n"
@@ -346,7 +344,7 @@ async def setup_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 @admin_only
 async def today_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    bookings  = get_todays_bookings()
+    bookings = get_todays_bookings()   # ← Sheets
     today_str = date.today().strftime("%A, %B %d, %Y")
 
     if not bookings:
@@ -357,15 +355,19 @@ async def today_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     lines = [f"📅 *Today's Schedule — {today_str}*\n_{len(bookings)} appointments_\n"]
+    total = 0
     for b in bookings:
         lines.append(
-            f"⏰ *{b['time']}*  —  {b['service']}\n"
-            f"   👤 {b['client_name']}  |  💰 {fmt_price(b['price'])}\n"
-            f"   🔖 `{b['id']}`"
+            f"⏰ *{b['time']}* — {b['service']}\n"
+            f" 👤 {b['client_name']} | 💰 {fmt_price(b['price'])}\n"
+            f" 🔖 `{b['id']}`"
         )
+        try:
+            total += int(str(b["price"]).replace(",", ""))
+        except (ValueError, TypeError):
+            pass
 
-    total = sum(int(b["price"]) for b in bookings if str(b["price"]).isdigit())
-    cur   = get_setting("currency", "₹")
+    cur = get_setting("currency", "₹")
     if total:
         lines.append(f"\n💰 *Expected Revenue: {cur}{total:,}*")
 
@@ -388,8 +390,8 @@ async def slots_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"📅 {fmt_date(date_str)} is not a working day.")
         return
 
-    avail_str  = "  ".join(available) if available else "_None available_"
-    booked_str = "  ".join(booked)    if booked    else "_None_"
+    avail_str  = " ".join(available) if available else "_None available_"
+    booked_str = " ".join(booked)    if booked    else "_None_"
 
     await update.message.reply_text(
         f"📅 *{fmt_date(date_str)}*\n\n"
@@ -401,10 +403,7 @@ async def slots_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 @admin_only
 async def clients_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    with get_db() as db:
-        rows = db.execute(
-            "SELECT * FROM clients ORDER BY visit_count DESC LIMIT 15"
-        ).fetchall()
+    rows = get_all_clients()   # ← Sheets
 
     if not rows:
         await update.message.reply_text("No clients yet.")
@@ -412,11 +411,13 @@ async def clients_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     lines = [f"👥 *Top Clients ({len(rows)} shown)*\n"]
     for c in rows:
-        uname = f" @{c['username']}" if c["username"] else ""
-        vip   = "  🌟 VIP" if c["visit_count"] > 5 else ""
+        uname = f" @{c['Username']}" if c.get("Username") else ""
+        visit = int(c.get("Visit Count", 0))
+        vip   = " 🌟 VIP" if c.get("VIP") == "YES" else ""
+        last  = str(c.get("Last Seen", ""))[:10]
         lines.append(
-            f"👤 *{c['name']}*{uname}{vip}\n"
-            f"   🗓 {c['visit_count']} visits  |  Last: {c['last_seen'][:10]}"
+            f"👤 *{c['Name']}*{uname}{vip}\n"
+            f" 🗓 {visit} visits | Last: {last}"
         )
 
     await update.message.reply_text("\n\n".join(lines), parse_mode="Markdown")
@@ -432,23 +433,21 @@ async def broadcast_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    with get_db() as db:
-        client_ids = db.execute("SELECT DISTINCT user_id FROM clients").fetchall()
-
-    salon        = get_setting("salon_name", "Maison Lumière")
+    client_ids = get_all_user_ids()   # ← Sheets
+    salon = get_setting("salon_name", "Maison Lumière")
     sent, failed = 0, 0
 
-    for c in client_ids:
+    for uid in client_ids:
         try:
             await context.bot.send_message(
-                chat_id=c["user_id"],
+                chat_id=uid,
                 text=f"📢 *{salon}*\n\n{msg}",
                 parse_mode="Markdown",
                 reply_markup=book_keyboard(),
             )
             sent += 1
         except Exception as e:
-            logger.warning(f"[BROADCAST] Failed for {c['user_id']}: {e}")
+            logger.warning(f"[BROADCAST] Failed for {uid}: {e}")
             failed += 1
 
     await update.message.reply_text(
@@ -458,26 +457,22 @@ async def broadcast_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 @admin_only
 async def admin_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    with get_db() as db:
-        rows  = db.execute(
-            "SELECT * FROM bookings ORDER BY created_at DESC LIMIT 10"
-        ).fetchall()
-        total = db.execute(
-            "SELECT COUNT(*) as c FROM bookings WHERE status='confirmed'"
-        ).fetchone()["c"]
+    rows = get_all_bookings()   # ← Sheets
+    confirmed = sum(1 for b in rows if b["status"] == "confirmed")
 
     if not rows:
         await update.message.reply_text("No bookings yet.")
         return
 
-    lines = [f"✦ *All Bookings — {total} confirmed*\n"]
-    for b in rows:
+    lines = [f"✦ *All Bookings — {confirmed} confirmed*\n"]
+    for b in rows[:10]:   # show latest 10
         icon = "✅" if b["status"] == "confirmed" else "❌"
         lines.append(
-            f"{icon} `{b['id']}`  —  {b['service']}\n"
-            f"👤 {b['client_name']}  |  🎨 {b['stylist']}\n"
-            f"📅 {fmt_date(b['date'])}  ⏰ {b['time']}  💰 {fmt_price(b['price'])}"
+            f"{icon} `{b['id']}` — {b['service']}\n"
+            f"👤 {b['client_name']} | 🎨 {b['stylist']}\n"
+            f"📅 {fmt_date(b['date'])} ⏰ {b['time']} 💰 {fmt_price(b['price'])}"
         )
+
     await update.message.reply_text("\n\n".join(lines), parse_mode="Markdown")
 
 
@@ -485,10 +480,9 @@ async def admin_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def backup_now_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "⏳ Running backup now...\n\nYou will receive:\n"
-        "1️⃣ Database file (.db)\n"
-        "2️⃣ Excel export (.csv)\n"
-        "3️⃣ Revenue summary\n"
-        "4️⃣ Google Sheets sync (Backup + Revenue tabs)"
+        "1️⃣ Excel export (.csv)\n"
+        "2️⃣ Revenue summary\n"
+        "3️⃣ Google Sheets sync (Backup + Revenue tabs)"
     )
     await run_backup(context.bot, ADMIN_CHAT_ID)
 
@@ -503,7 +497,6 @@ async def setname_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     set_setting("salon_name", val)
     await update.message.reply_text(f"✅ Salon name: *{val}*", parse_mode="Markdown")
 
-
 @admin_only
 async def setaddress_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     val = " ".join(context.args)
@@ -511,7 +504,6 @@ async def setaddress_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Usage: /setaddress Your Address"); return
     set_setting("salon_address", val)
     await update.message.reply_text(f"✅ Address: *{val}*", parse_mode="Markdown")
-
 
 @admin_only
 async def setphone_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -521,7 +513,6 @@ async def setphone_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     set_setting("salon_phone", val)
     await update.message.reply_text(f"✅ Phone: *{val}*", parse_mode="Markdown")
 
-
 @admin_only
 async def setcurrency_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     val = " ".join(context.args).strip()
@@ -530,18 +521,16 @@ async def setcurrency_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     set_setting("currency", val)
     await update.message.reply_text(f"✅ Currency: *{val}*", parse_mode="Markdown")
 
-
 @admin_only
 async def sethours_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if len(context.args) != 2:
         await update.message.reply_text("Usage: /sethours 09:00 18:00"); return
     open_t, close_t = context.args
-    set_setting("open_time",  open_t)
+    set_setting("open_time", open_t)
     set_setting("close_time", close_t)
     await update.message.reply_text(
         f"✅ Hours: *{open_t}* – *{close_t}*", parse_mode="Markdown"
     )
-
 
 @admin_only
 async def setdays_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -552,9 +541,8 @@ async def setdays_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     val = context.args[0]
     set_setting("working_days", val)
     day_names = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
-    days_str  = ", ".join(day_names[int(d)] for d in val.split(","))
+    days_str = ", ".join(day_names[int(d)] for d in val.split(","))
     await update.message.reply_text(f"✅ Working days: *{days_str}*", parse_mode="Markdown")
-
 
 @admin_only
 async def setslot_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -564,7 +552,6 @@ async def setslot_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         f"✅ Slot duration: *{context.args[0]} min*", parse_mode="Markdown"
     )
-
 
 # ── Service management ────────────────────────────────────────────────────────
 
@@ -588,7 +575,6 @@ async def addservice_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         parse_mode="Markdown",
     )
 
-
 @admin_only
 async def listservices_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     services = get_services()
@@ -603,7 +589,6 @@ async def listservices_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         parse_mode="Markdown",
     )
 
-
 @admin_only
 async def removeservice_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not context.args:
@@ -611,7 +596,6 @@ async def removeservice_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     with get_db() as db:
         db.execute("UPDATE services SET active=0 WHERE id=?", (int(context.args[0]),))
     await update.message.reply_text(f"✅ Service ID {context.args[0]} removed.")
-
 
 # ── Staff management ──────────────────────────────────────────────────────────
 
@@ -626,7 +610,6 @@ async def addstaff_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"✅ Staff added: *{name}* — _{title}_", parse_mode="Markdown"
     )
 
-
 @admin_only
 async def liststaff_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     staff = get_staff()
@@ -639,7 +622,6 @@ async def liststaff_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "\n".join(lines) + "\n\nTo remove: `/removestaff ID`",
         parse_mode="Markdown",
     )
-
 
 @admin_only
 async def removestaff_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -661,7 +643,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     data = query.data
 
     if data == "my_bookings":
-        rows = get_user_bookings(uid)
+        rows = get_user_bookings(uid)   # ← Sheets
         if not rows:
             text = "No bookings yet. Use /book to reserve your experience. ✦"
         else:
@@ -670,7 +652,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 icon = "✅" if b["status"] == "confirmed" else "❌"
                 lines.append(
                     f"{icon} `{b['id']}`\n"
-                    f"🪄 {b['service']}  |  📅 {fmt_date(b['date'])}  ⏰ {b['time']}"
+                    f"🪄 {b['service']} | 📅 {fmt_date(b['date'])} ⏰ {b['time']}"
                 )
             text = "\n\n".join(lines)
         keyboard = InlineKeyboardMarkup([[
@@ -694,34 +676,32 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     elif data.startswith("confirm_cancel:"):
         ref = data.split(":")[1]
-        if cancel_booking(ref):
-            # [NEW] Update status in Google Sheets
-            update_booking_status(ref, "cancelled")
-
+        if cancel_booking_in_sheets(ref):   # ← Sheets
+            b = get_booking(ref)
             await query.edit_message_text(
                 f"✅ Booking `{ref}` has been cancelled.\n\n"
                 f"The slot is now available for others.",
                 parse_mode="Markdown",
             )
-            b = get_booking(ref)
-            await context.bot.send_message(
-                chat_id=ADMIN_CHAT_ID,
-                text=(
-                    f"❌ *Booking Cancelled*\n\n"
-                    f"`{ref}`\n"
-                    f"👤 {b['client_name']}\n"
-                    f"🪄 {b['service']}\n"
-                    f"📅 {fmt_date(b['date'])}  ⏰ {b['time']}"
-                ),
-                parse_mode="Markdown",
-            )
+            if b:
+                await context.bot.send_message(
+                    chat_id=ADMIN_CHAT_ID,
+                    text=(
+                        f"❌ *Booking Cancelled*\n\n"
+                        f"`{ref}`\n"
+                        f"👤 {b['client_name']}\n"
+                        f"🪄 {b['service']}\n"
+                        f"📅 {fmt_date(b['date'])} ⏰ {b['time']}"
+                    ),
+                    parse_mode="Markdown",
+                )
         else:
             await query.edit_message_text("❌ Could not cancel. It may already be cancelled.")
 
     elif data.startswith("confirm_reschedule:"):
         ref = data.split(":")[1]
-        if cancel_booking(ref):
-            update_booking_status(ref, "rescheduled")   # [NEW] sheets update
+        if cancel_booking_in_sheets(ref):   # ← Sheets
+            update_booking_status(ref, "rescheduled")
             await query.edit_message_text(
                 f"✅ Booking `{ref}` cancelled.\n\nOpening booking app to rebook...",
                 parse_mode="Markdown",
@@ -745,7 +725,6 @@ async def handle_web_app_data(update: Update, context: ContextTypes.DEFAULT_TYPE
 
     logger.info(f"[BOOKING] Incoming from {user.id} ({user.full_name}): {raw}")
 
-    # ── Parse JSON ────────────────────────────────────────────────────────
     try:
         data = json.loads(raw)
     except json.JSONDecodeError as e:
@@ -754,62 +733,35 @@ async def handle_web_app_data(update: Update, context: ContextTypes.DEFAULT_TYPE
         return
 
     if data.get("action") != "booking":
-        logger.info(f"[BOOKING] Non-booking action ignored: {data.get('action')}")
         return
 
-    date_str = data.get("date", "")
-    time_str = data.get("time", "")
-
-    # ── Availability check (skip block for now — Mini App uses static slots) ──
-    if date_str and time_str and not is_slot_available(date_str, time_str):
-        logger.warning(
-            f"[BOOKING] Slot {time_str} on {date_str} unavailable — "
-            "proceeding (Mini App uses static slots; re-enable once real-time sync is live)"
+    # ── Save directly to Google Sheets ───────────────────────────────
+    try:
+        ref = save_booking_to_sheets(data, user)
+        logger.info(f"[BOOKING] Saved to Sheets: {ref}")
+    except Exception as e:
+        logger.error(f"[BOOKING] Failed to save to Sheets: {e}")
+        await msg.reply_text(
+            "⚠️ Could not save your booking right now. Please try again in a moment."
         )
+        return
 
-    # ── Save to SQLite ────────────────────────────────────────────────────
-    ref = save_booking(data, user)
-    logger.info(f"[BOOKING] Saved to DB: {ref}")
-
-    # Build uniform booking dict for messages + sheets
     b = {
         "id":       ref,
-        "service":  data.get("service",  "—"),
-        "stylist":  data.get("stylist",  "—"),
-        "date":     date_str,
-        "time":     time_str,
+        "service":  data.get("service", "—"),
+        "stylist":  data.get("stylist", "—"),
+        "date":     data.get("date", ""),
+        "time":     data.get("time", ""),
         "duration": data.get("duration", "—"),
-        "price":    data.get("price",    "TBD"),
-        "notes":    data.get("notes",    ""),
+        "price":    data.get("price", "TBD"),
+        "notes":    data.get("notes", ""),
     }
 
-    # ── [NEW] Sync booking to Google Sheets ───────────────────────────────
-    try:
-        booking_sheet_data = {
-            **b,
-            "user_id":      user.id,
-            "client_name":  user.full_name or "Unknown",
-            "username":     user.username or "",
-            "status":       "confirmed",
-            "created_at":   datetime.now().strftime("%Y-%m-%d %H:%M"),
-        }
-        sync_booking(booking_sheet_data)
-    except Exception as e:
-        logger.error(f"[BOOKING] Google Sheets booking sync failed (non-fatal): {e}")
-
-    # ── [NEW] Sync client to Google Sheets ────────────────────────────────
-    try:
-        client_row = get_client(user.id)
-        if client_row:
-            sync_client(dict(client_row))
-    except Exception as e:
-        logger.error(f"[BOOKING] Google Sheets client sync failed (non-fatal): {e}")
-
-    # ── Send confirmation to client ───────────────────────────────────────
+    # ── Send confirmation to client ───────────────────────────────────
     keyboard = InlineKeyboardMarkup([
         [
             InlineKeyboardButton("📋 My Bookings", callback_data="my_bookings"),
-            InlineKeyboardButton("✦ Book Again",   web_app=WebAppInfo(url=MINI_APP_URL)),
+            InlineKeyboardButton("✦ Book Again", web_app=WebAppInfo(url=MINI_APP_URL)),
         ],
     ])
     try:
@@ -822,14 +774,13 @@ async def handle_web_app_data(update: Update, context: ContextTypes.DEFAULT_TYPE
     except Exception as e:
         logger.error(f"[BOOKING] ❌ Confirmation send failed: {e}")
 
-    # ── Send admin alert ──────────────────────────────────────────────────
+    # ── Send admin alert ──────────────────────────────────────────────
     try:
         await context.bot.send_message(
             chat_id=ADMIN_CHAT_ID,
             text=admin_alert_msg(b, user),
             parse_mode="Markdown",
         )
-        logger.info(f"[BOOKING] ✅ Admin notified")
     except Exception as e:
         logger.error(f"[BOOKING] ❌ Admin alert failed: {e}")
 
@@ -839,33 +790,28 @@ async def handle_web_app_data(update: Update, context: ContextTypes.DEFAULT_TYPE
 # ══════════════════════════════════════════════════════════════════════════════
 
 async def send_reminders(bot):
-    """
-    Called every 15 minutes by APScheduler.
-    Sends warm, human-toned reminder messages for upcoming appointments.
-    """
-    due = get_upcoming_reminders()
+    due = get_upcoming_reminders()   # ← Sheets
     if not due:
         return
 
     salon = get_setting("salon_name", "Maison Lumière")
 
     for kind, b in due:
-        # [IMPROVED] Warmer, more human reminder text
         if kind == "24h":
-            label   = "tomorrow"
-            intro   = "Just a friendly reminder — your appointment is coming up!"
-            emoji   = "🌟"
+            label = "tomorrow"
+            intro = "Just a friendly reminder — your appointment is coming up!"
+            emoji = "🌟"
         else:
-            label   = "in about 1 hour"
-            intro   = "Almost time! We're getting ready for your visit."
-            emoji   = "✨"
+            label = "in about 1 hour"
+            intro = "Almost time! We're getting ready for your visit."
+            emoji = "✨"
 
         text = (
             f"{emoji} *Reminder — {salon}*\n\n"
             f"{intro}\n\n"
             f"Your appointment is *{label}*:\n\n"
-            f"🪄 {b['service']}  |  👤 {b['stylist']}\n"
-            f"📅 {fmt_date(b['date'])}  ⏰ {b['time']}\n\n"
+            f"🪄 {b['service']} | 👤 {b['stylist']}\n"
+            f"📅 {fmt_date(b['date'])} ⏰ {b['time']}\n\n"
             f"🔖 `{b['id']}`\n\n"
             f"_Need to cancel? /cancel {b['id']}_\n"
             f"_See you soon! 💇_"
@@ -875,8 +821,8 @@ async def send_reminders(bot):
             await bot.send_message(
                 chat_id=b["user_id"], text=text, parse_mode="Markdown"
             )
-            mark_reminder_sent(b["id"], kind)
-            logger.info(f"[REMINDER] {kind} reminder sent to {b['user_id']} for {b['id']}")
+            mark_reminder_sent_sheets(b["id"], kind)   # ← Sheets
+            logger.info(f"[REMINDER] {kind} sent to {b['user_id']} for {b['id']}")
         except Exception as e:
             logger.warning(f"[REMINDER] Failed for {b['id']}: {e}")
 
@@ -886,13 +832,13 @@ async def send_reminders(bot):
 # ══════════════════════════════════════════════════════════════════════════════
 
 def main():
-    # ── Initialise database ───────────────────────────────────────────────
+    # ── Initialise database (settings/staff/services only) ───────────
     init_db()
 
-    # ── Build Telegram application ────────────────────────────────────────
+    # ── Build Telegram application ────────────────────────────────────
     app = Application.builder().token(BOT_TOKEN).build()
 
-    # ── Client commands ───────────────────────────────────────────────────
+    # ── Client commands ───────────────────────────────────────────────
     app.add_handler(CommandHandler("start",       start))
     app.add_handler(CommandHandler("book",        book))
     app.add_handler(CommandHandler("mybookings",  my_bookings_cmd))
@@ -901,7 +847,7 @@ def main():
     app.add_handler(CommandHandler("status",      status_cmd))
     app.add_handler(CommandHandler("help",        help_cmd))
 
-    # ── Admin commands ────────────────────────────────────────────────────
+    # ── Admin commands ────────────────────────────────────────────────
     app.add_handler(CommandHandler("setup",         setup_cmd))
     app.add_handler(CommandHandler("today",         today_cmd))
     app.add_handler(CommandHandler("slots",         slots_cmd))
@@ -923,13 +869,12 @@ def main():
     app.add_handler(CommandHandler("liststaff",     liststaff_cmd))
     app.add_handler(CommandHandler("removestaff",   removestaff_cmd))
 
-    # ── Callbacks + Mini App data ─────────────────────────────────────────
+    # ── Callbacks + Mini App data ─────────────────────────────────────
     app.add_handler(CallbackQueryHandler(handle_callback))
     app.add_handler(MessageHandler(filters.StatusUpdate.WEB_APP_DATA, handle_web_app_data))
 
-    # ── Schedulers ────────────────────────────────────────────────────────
+    # ── Schedulers ────────────────────────────────────────────────────
     scheduler = AsyncIOScheduler()
-
     scheduler.add_job(
         send_reminders,
         trigger=IntervalTrigger(minutes=15),
@@ -944,13 +889,11 @@ def main():
         id="backup",
         replace_existing=True,
     )
-
     scheduler.start()
     logger.info("[SCHEDULER] Reminder job started (every 15 min)")
     logger.info("[SCHEDULER] Backup job started (every 6 hours)")
 
-    # ── Go! ───────────────────────────────────────────────────────────────
-    logger.info(f"✦ Salon Bot v3.0 live | Admin: {ADMIN_CHAT_ID}")
+    logger.info(f"✦ Salon Bot v3.1 live | Admin: {ADMIN_CHAT_ID}")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 
