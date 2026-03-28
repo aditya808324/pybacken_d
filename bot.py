@@ -11,19 +11,18 @@ from oauth2client.service_account import ServiceAccountCredentials
 from aiogram import Bot, Dispatcher, executor, types
 from aiohttp import web
 
-# --- CONFIGURATION ---
+# --- CONFIG ---
 API_TOKEN = os.getenv("BOT_TOKEN")
 ADMIN_ID = os.getenv("ADMIN_CHAT_ID")
 SHEET_NAME = os.getenv("GOOGLE_SHEET_NAME")
 CREDS_JSON = os.getenv("GOOGLE_CREDENTIALS")
 DB_PATH = "salon.db"
-SCOPES = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
 
 logging.basicConfig(level=logging.INFO)
 bot = Bot(token=API_TOKEN)
 dp = Dispatcher(bot)
 
-# --- DATABASE CACHE LAYER ---
+# --- DATABASE LAYER ---
 @contextmanager
 def get_db():
     conn = sqlite3.connect(DB_PATH)
@@ -36,100 +35,103 @@ def get_db():
 
 def init_db():
     with get_db() as db:
-        db.execute("CREATE TABLE IF NOT EXISTS staff (id INTEGER PRIMARY KEY, name TEXT, title TEXT, active INTEGER)")
-        db.execute("CREATE TABLE IF NOT EXISTS services (id INTEGER PRIMARY KEY, name TEXT, duration INTEGER, price INTEGER, active INTEGER)")
-        db.execute("""
-            CREATE TABLE IF NOT EXISTS bookings (
-                id TEXT PRIMARY KEY, user_id INTEGER, client_name TEXT, 
-                service TEXT, stylist TEXT, date TEXT, time TEXT, status TEXT
-            )
-        """)
+        db.execute("CREATE TABLE IF NOT EXISTS staff (id INTEGER, name TEXT, title TEXT)")
+        db.execute("CREATE TABLE IF NOT EXISTS services (id INTEGER, name TEXT, duration INTEGER, price INTEGER)")
+        db.execute("""CREATE TABLE IF NOT EXISTS bookings 
+                     (id TEXT PRIMARY KEY, user_id TEXT, name TEXT, service TEXT, 
+                      date TEXT, time TEXT, status TEXT)""")
 
-def rehydrate_cache(data):
+def sync_from_sheets():
+    try:
+        scope = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
+        creds = ServiceAccountCredentials.from_json_keyfile_dict(json.loads(CREDS_JSON), scope)
+        client = gspread.authorize(creds)
+        sh = client.open(SHEET_NAME)
+        
+        svcs = sh.worksheet("Services").get_all_records()
+        stf = sh.worksheet("Staff").get_all_records()
+        
+        with get_db() as db:
+            db.execute("DELETE FROM services")
+            db.execute("DELETE FROM staff")
+            for s in svcs:
+                db.execute("INSERT INTO services VALUES (?,?,?,?)", (s['ID'], s['Name'], s['Duration'], s['Price']))
+            for s in stf:
+                db.execute("INSERT INTO staff VALUES (?,?,?)", (s['ID'], s['Name'], s.get('Title', 'Expert')))
+        print("✅ Cache synced.")
+    except Exception as e:
+        print(f"❌ Sync Error: {e}")
+
+# --- API HANDLERS ---
+async def api_services(request):
     with get_db() as db:
-        db.execute("DELETE FROM staff")
-        db.execute("DELETE FROM services")
-        db.execute("DELETE FROM bookings")
-        for s in data['staff']:
-            db.execute("INSERT INTO staff VALUES (?,?,?,?)", (s.get('ID'), s.get('Name'), s.get('Title'), 1))
-        for s in data['services']:
-            db.execute("INSERT INTO services VALUES (?,?,?,?,?)", (s.get('ID'), s.get('Name'), s.get('Duration'), s.get('Price'), 1))
-        for b in data['bookings']:
-            db.execute("INSERT INTO bookings VALUES (?,?,?,?,?,?,?,?)", 
-                       (b.get('Booking ID'), b.get('User ID'), b.get('Client Name'), b.get('Service'), b.get('Stylist'), b.get('Date'), b.get('Time'), b.get('Status')))
+        rows = db.execute("SELECT * FROM services").fetchall()
+        return web.json_response([dict(r) for r in rows], headers={"Access-Control-Allow-Origin": "*"})
 
-# --- GOOGLE SHEETS LAYER ---
-class SheetsClient:
-    _sh = None
-    @classmethod
-    def get_sh(cls):
-        if not cls._sh:
-            creds = ServiceAccountCredentials.from_json_keyfile_dict(json.loads(CREDS_JSON), SCOPES)
-            cls._sh = gspread.authorize(creds).open(SHEET_NAME)
-        return cls._sh
-
-async def fetch_sheets_data():
-    sh = SheetsClient.get_sh()
-    return {
-        "staff": sh.worksheet("Staff").get_all_records(),
-        "services": sh.worksheet("Services").get_all_records(),
-        "bookings": sh.worksheet("Bookings").get_all_records()
-    }
-
-# --- API HANDLERS (For Vercel) ---
-async def api_init(request):
+async def api_staff(request):
     with get_db() as db:
-        services = [dict(r) for r in db.execute("SELECT * FROM services").fetchall()]
-        staff = [dict(r) for r in db.execute("SELECT * FROM staff").fetchall()]
-    return web.json_response({"services": services, "staff": staff}, headers={"Access-Control-Allow-Origin": "*"})
+        rows = db.execute("SELECT * FROM staff").fetchall()
+        return web.json_response([dict(r) for r in rows], headers={"Access-Control-Allow-Origin": "*"})
+
+async def api_slots(request):
+    date_val = request.query.get('date')
+    all_slots = ["10:00", "11:00", "12:00", "13:00", "14:00", "15:00", "16:00", "17:00", "18:00"]
+    with get_db() as db:
+        booked = db.execute("SELECT time FROM bookings WHERE date=? AND status='confirmed'", (date_val,)).fetchall()
+        booked_list = [r['time'] for r in booked]
+    return web.json_response([{"time": t, "booked": t in booked_list} for t in all_slots], headers={"Access-Control-Allow-Origin": "*"})
 
 async def api_book(request):
     data = await request.json()
-    ref = "ML-" + uuid.uuid4().hex[:6].upper()
-    sh = SheetsClient.get_sh()
-    ws = sh.worksheet("Bookings")
+    booking_id = "SH-" + uuid.uuid4().hex[:6].upper()
     
-    row = [ref, data.get('user_id'), data.get('full_name'), data.get('username', ''), 
-           data.get('service'), data.get('stylist'), data.get('date'), data.get('time'), 
-           "60 min", data.get('price'), "confirmed", data.get('notes', ''), "NO", "NO", datetime.now().isoformat()]
-    ws.append_row(row)
-    
-    # Update local cache
     with get_db() as db:
-        db.execute("INSERT INTO bookings VALUES (?,?,?,?,?,?,?,?)", 
-                   (ref, data.get('user_id'), data.get('full_name'), data.get('service'), data.get('stylist'), data.get('date'), data.get('time'), 'confirmed'))
+        db.execute("INSERT INTO bookings VALUES (?,?,?,?,?,?,?)", 
+                   (booking_id, data['user_id'], data['clientName'], data['serviceNames'], data['date'], data['slot'], 'confirmed'))
     
-    await bot.send_message(ADMIN_ID, f"🆕 **New Booking**\nRef: {ref}\nClient: {data.get('full_name')}\nService: {data.get('service')}", parse_mode="Markdown")
-    return web.json_response({"success": True, "booking_id": ref}, headers={"Access-Control-Allow-Origin": "*"})
+    # Update Google Sheets asynchronously
+    try:
+        scope = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
+        creds = ServiceAccountCredentials.from_json_keyfile_dict(json.loads(CREDS_JSON), scope)
+        ws = gspread.authorize(creds).open(SHEET_NAME).worksheet("Bookings")
+        ws.append_row([booking_id, data['user_id'], data['clientName'], data['serviceNames'], data['date'], data['slot'], 'confirmed', datetime.now().isoformat()])
+    except: pass
 
-async def api_options(request):
-    return web.Response(headers={
-        "Access-Control-Allow-Origin": "*",
-        "Access-Control-Allow-Methods": "POST, GET, OPTIONS",
-        "Access-Control-Allow-Headers": "Content-Type"
-    })
+    msg = f"🌸 *New Booking: {booking_id}*\n\n👤 {data['clientName']}\n✂️ {data['serviceNames']}\n📅 {data['date']} @ {data['slot']}"
+    await bot.send_message(ADMIN_ID, msg, parse_mode="Markdown")
+    return web.json_response({"success": True, "booking_id": booking_id}, headers={"Access-Control-Allow-Origin": "*"})
 
-# --- BOT HANDLERS ---
+# --- BOT COMMANDS ---
 @dp.message_handler(commands=['start'])
-async def start_cmd(message: types.Message):
-    url = os.getenv("MINIAPP_URL")
-    markup = types.InlineKeyboardMarkup().add(types.InlineKeyboardButton("✨ Book Now", web_app=types.WebAppInfo(url=url)))
-    await message.answer("Welcome to Maison Lumière! Tap below to book.", reply_markup=markup)
+async def cmd_start(m: types.Message):
+    kb = types.InlineKeyboardMarkup().add(types.InlineKeyboardButton("✨ Book Appointment", web_app=types.WebAppInfo(url=os.getenv("MINIAPP_URL"))))
+    await m.answer("Welcome to Shringar Studio! Click below to book your glow-up.", reply_markup=kb)
 
+@dp.message_handler(commands=['cancel'])
+async def cmd_cancel(m: types.Message):
+    parts = m.text.split()
+    if len(parts) < 2: return await m.answer("Please provide ID: `/cancel SH-XXXXXX`", parse_mode="Markdown")
+    bid = parts[1].upper()
+    with get_db() as db:
+        db.execute("UPDATE bookings SET status='cancelled' WHERE id=?", (bid,))
+    await m.answer(f"✅ Booking {bid} has been cancelled.")
+
+# --- SERVER START ---
 async def on_startup(_):
     init_db()
-    data = await fetch_sheets_data()
-    rehydrate_cache(data)
-    
-    # Start API server on the port Railway provides
+    sync_from_sheets()
     app = web.Application()
-    app.router.add_get('/api/init', api_init)
+    app.router.add_get('/api/services', api_services)
+    app.router.add_get('/api/staff', api_staff)
+    app.router.add_get('/api/slots', api_slots)
     app.router.add_post('/api/book', api_book)
-    app.router.add_options('/{tail:.*}', api_options)
+    
+    async def opts(request): return web.Response(headers={"Access-Control-Allow-Origin": "*", "Access-Control-Allow-Methods": "POST, GET, OPTIONS", "Access-Control-Allow-Headers": "Content-Type"})
+    app.router.add_options('/{tail:.*}', opts)
+
     runner = web.AppRunner(app)
     await runner.setup()
-    site = web.TCPSite(runner, '0.0.0.0', int(os.getenv("PORT", 8080)))
-    await site.start()
+    await web.TCPSite(runner, '0.0.0.0', int(os.getenv("PORT", 8080))).start()
 
 if __name__ == '__main__':
     executor.start_polling(dp, on_startup=on_startup, skip_updates=True)
