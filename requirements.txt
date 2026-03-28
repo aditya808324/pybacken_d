@@ -1,15 +1,5 @@
-# ── Telegram Bot ──────────────────────────────────────────────────────────────
-python-telegram-bot==20.7
-
-# ── Scheduler ─────────────────────────────────────────────────────────────────
-APScheduler==3.10.4
-
-# ── HTTP client (used by python-telegram-bot) ─────────────────────────────────
-aiohttp==3.9.3
-
-# ── Google Sheets ─────────────────────────────────────────────────────────────
-gspread==6.0.2
+aiogram==2.25.1
+gspread==5.10.0
 oauth2client==4.1.3
-
-# ── Utilities ─────────────────────────────────────────────────────────────────
-python-dotenv==1.0.1        # optional: load .env file locally
+aiohttp==3.8.5
+python-dotenv==1.0.0
